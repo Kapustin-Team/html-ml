@@ -1,0 +1,2 @@
+[console_scripts]
+html-ml = html_ml.cli:app
