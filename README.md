@@ -51,6 +51,8 @@ source .venv/bin/activate
 pip install -e .
 cp .env.example .env
 html-ml initdb
+html-ml research-polymarket --limit-pages 2
+html-ml collect-polymarket --max-pages 2
 html-ml collect-stub
 html-ml run-baseline --aggression aggressive
 ```
@@ -58,7 +60,7 @@ html-ml run-baseline --aggression aggressive
 ## Next implementation steps
 
 1. Real Playwright-based HLTV live collector
-2. Real Polymarket market discovery + odds normalization
-3. Matching HLTV live games to Polymarket markets
-4. Paper position engine with buy / scale-in / reduce / close
-5. OpenRouter policy adapter + ML baselines
+2. Matching HLTV live games to Polymarket markets
+3. Paper position engine with buy / scale-in / reduce / close
+4. OpenRouter policy adapter + ML baselines
+5. Replay/backtest runner over stored snapshots

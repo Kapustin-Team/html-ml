@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 import typer
 from rich.console import Console
@@ -34,6 +35,49 @@ def collect_stub() -> None:
         for odds in poly.collect_once_stub():
             save_odds_snapshot(db, odds)
     console.print('[green]Stub live snapshots saved.[/green]')
+
+
+@app.command()
+def research_polymarket(limit_pages: int = 2) -> None:
+    poly = PolymarketCollector()
+    events = list(poly.iter_cs2_events(max_pages=limit_pages))
+    market_counter: Counter[str] = Counter()
+    rows: list[tuple[str, str, int]] = []
+
+    for event in events:
+        title = event.get('title') or 'Untitled'
+        markets = event.get('markets') or []
+        rows.append((str(event.get('id')), title, len(markets)))
+        for market in markets:
+            mt = poly.classify_market_type(market.get('question') or '')
+            market_counter[str(mt.value if mt else 'unknown')] += 1
+
+    table = Table(title='Polymarket CS2 Events')
+    table.add_column('Event ID')
+    table.add_column('Title')
+    table.add_column('Markets')
+    for event_id, title, count in rows[:20]:
+        table.add_row(event_id, title, str(count))
+    console.print(table)
+
+    summary = Table(title='Detected Market Types')
+    summary.add_column('Type')
+    summary.add_column('Count')
+    for key, count in market_counter.most_common():
+        summary.add_row(key, str(count))
+    console.print(summary)
+    console.print(f'[cyan]Scanned events:[/cyan] {len(events)}')
+
+
+@app.command()
+def collect_polymarket(max_pages: int = 2) -> None:
+    init_db()
+    poly = PolymarketCollector()
+    snapshots = poly.collect_cs2_market_snapshots(max_pages=max_pages)
+    with SessionLocal() as db:
+        for odds in snapshots:
+            save_odds_snapshot(db, odds)
+    console.print(f'[green]Saved {len(snapshots)} Polymarket odds snapshots.[/green]')
 
 
 @app.command()
