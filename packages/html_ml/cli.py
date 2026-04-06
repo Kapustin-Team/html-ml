@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
 from html_ml.agents.baseline import BaselineFlatBetAgent
@@ -174,6 +176,68 @@ def watch_today(limit: int = 12, max_pages: int = 5) -> None:
         table.add_row(end_at, match.title, moneyline, total, handicap, f'{match.score:.2f}')
 
     console.print(table)
+
+
+@app.command()
+def poll_watchlist(iterations: int = 3, interval_sec: int = 30, limit: int = 10, max_pages: int = 5) -> None:
+    init_db()
+    poly = PolymarketCollector()
+    total_saved = 0
+    for idx in range(iterations):
+        snapshots = poly.collect_watchlist_snapshots(limit=limit, max_pages=max_pages)
+        with SessionLocal() as db:
+            for snapshot in snapshots:
+                save_odds_snapshot(db, snapshot)
+        total_saved += len(snapshots)
+        console.print(
+            f'[green]poll {idx + 1}/{iterations}[/green] saved {len(snapshots)} snapshots '
+            f'(total {total_saved}) at {datetime.now(timezone.utc).isoformat(timespec="seconds")}'
+        )
+        if idx < iterations - 1:
+            time.sleep(interval_sec)
+
+
+@app.command()
+def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles: int = 20) -> None:
+    poly = PolymarketCollector()
+
+    def build_table() -> Table:
+        matches = poly.top_watch_matches(limit=limit, max_pages=max_pages, only_future=True)
+        table = Table(title='html-ml live dashboard')
+        table.add_column('End (UTC)')
+        table.add_column('Match')
+        table.add_column('Moneyline')
+        table.add_column('O/U')
+        table.add_column('HCAP')
+        table.add_column('Score')
+
+        for match in matches:
+            end_at = match.end_at.isoformat(timespec='minutes') if match.end_at else '-'
+            moneyline = '-'
+            total = '-'
+            handicap = '-'
+
+            if match.match_market and len(match.match_market.outcomes) >= 2 and len(match.match_market.prices) >= 2:
+                moneyline = (
+                    f"{match.match_market.outcomes[0]} {match.match_market.prices[0]:.3f} | "
+                    f"{match.match_market.outcomes[1]} {match.match_market.prices[1]:.3f}"
+                )
+            if match.total_market and len(match.total_market.prices) >= 2:
+                total = f"{match.total_market.prices[0]:.3f} / {match.total_market.prices[1]:.3f}"
+            if match.handicap_market and len(match.handicap_market.outcomes) >= 2 and len(match.handicap_market.prices) >= 2:
+                handicap = (
+                    f"{match.handicap_market.outcomes[0]} {match.handicap_market.prices[0]:.3f} | "
+                    f"{match.handicap_market.outcomes[1]} {match.handicap_market.prices[1]:.3f}"
+                )
+
+            table.add_row(end_at, match.title, moneyline, total, handicap, f'{match.score:.2f}')
+
+        return table
+
+    with Live(build_table(), console=console, refresh_per_second=4) as live:
+        for _ in range(cycles - 1):
+            time.sleep(refresh_sec)
+            live.update(build_table())
 
 
 @app.command()

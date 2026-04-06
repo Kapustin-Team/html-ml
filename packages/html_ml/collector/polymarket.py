@@ -234,6 +234,44 @@ class PolymarketCollector:
             matches.append(watch_match)
         return matches
 
+    def top_watch_matches(self, limit: int = 10, max_pages: int = 5, only_future: bool = True) -> list[WatchMatch]:
+        matches = self.list_watch_matches(max_pages=max_pages, only_future=only_future)
+        matches.sort(key=lambda m: ((m.end_at or datetime.max.replace(tzinfo=timezone.utc)), -m.score))
+        return matches[:limit]
+
+    def collect_watchlist_snapshots(self, limit: int = 10, max_pages: int = 5) -> list[OddsSnapshot]:
+        observed_at = datetime.now(timezone.utc)
+        snapshots: list[OddsSnapshot] = []
+        for match in self.top_watch_matches(limit=limit, max_pages=max_pages, only_future=True):
+            for market_type, watch_market in (
+                (MarketType.MATCH_WINNER, match.match_market),
+                (MarketType.MAP_TOTALS, match.total_market),
+                (MarketType.MAP_HANDICAP, match.handicap_market),
+            ):
+                if watch_market is None:
+                    continue
+                for outcome, price in zip(watch_market.outcomes, watch_market.prices):
+                    snapshots.append(
+                        OddsSnapshot(
+                            source='polymarket',
+                            market_id=f'{match.event_id}:{market_type.value}:{watch_market.question}',
+                            question=watch_market.question,
+                            market_type=market_type,
+                            selection=str(outcome),
+                            price=float(price),
+                            implied_probability=float(price),
+                            observed_at=observed_at,
+                            raw_payload={
+                                'event_id': match.event_id,
+                                'slug': match.slug,
+                                'title': match.title,
+                                'end_at': match.end_at.isoformat() if match.end_at else None,
+                                'watch_score': match.score,
+                            },
+                        )
+                    )
+        return snapshots
+
     def collect_cs2_market_snapshots(self, max_pages: int = 5) -> list[OddsSnapshot]:
         snapshots: list[OddsSnapshot] = []
         for event in self.iter_cs2_events(max_pages=max_pages):
