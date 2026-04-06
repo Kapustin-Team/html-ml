@@ -4,6 +4,9 @@ import json
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
+import subprocess
+import sys
 
 import typer
 from rich.console import Console
@@ -330,12 +333,29 @@ def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles
             live.update(build_table())
 
 
+def _enrich_hltv_live_state(item: dict, wait_sec: int = 8) -> dict:
+    href = item.get('href')
+    if not href or not item.get('live'):
+        return item
+    url = href if str(href).startswith('http') else f'https://www.hltv.org{href}'
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'hltv_match_details_playwright.py'
+    cmd = [sys.executable, str(script), '--url', url, '--wait-sec', str(wait_sec)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        item['detail_error'] = result.stderr.strip() or result.stdout.strip() or 'detail probe failed'
+        return item
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        item['detail_error'] = 'detail probe returned invalid json'
+        return item
+    state = payload.get('state') or {}
+    item['live_detail'] = state
+    return item
+
+
 @app.command()
 def probe_hltv(wait_sec: int = 15) -> None:
-    import subprocess
-    import sys
-    from pathlib import Path
-
     script = Path(__file__).resolve().parents[2] / 'scripts' / 'hltv_probe.py'
     cmd = [sys.executable, str(script), '--wait-sec', str(wait_sec)]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -365,7 +385,9 @@ def collect_hltv_matches(wait_sec: int = 12, limit: int = 20) -> None:
 
     payload = json.loads(result.stdout)
     collector = HLTVLiveCollector()
-    rows = [collector.match_entry_to_state(item) for item in payload.get('matches', [])[:limit]]
+    raw_items = payload.get('matches', [])[:limit]
+    enriched_items = [_enrich_hltv_live_state(item, wait_sec=max(6, min(wait_sec, 10))) for item in raw_items]
+    rows = [collector.match_entry_to_state(item) for item in enriched_items]
 
     init_db()
     with SessionLocal() as db:
@@ -468,6 +490,14 @@ def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView
             continue
 
         raw = match_row.raw_payload or {}
+        live_detail = raw.get('live_detail') or {}
+        live_probs = live_detail.get('live_win_probabilities') or {}
+        map_score = None
+        if match_row.maps_team_a is not None and match_row.maps_team_b is not None:
+            map_score = f'{match_row.maps_team_a}-{match_row.maps_team_b}'
+        round_score = None
+        if live_detail.get('score_team_a') is not None and live_detail.get('score_team_b') is not None:
+            round_score = f"{live_detail.get('score_team_a')}-{live_detail.get('score_team_b')}"
         views.append(
             LinkedMarketView(
                 hltv_match_id=match_row.external_match_id,
@@ -486,6 +516,13 @@ def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView
                 team_b_price=float(team_b_row.price),
                 team_a_prev_price=previous_by_key.get((team_a_row.market_id, team_a_row.selection), (None, None))[0],
                 team_b_prev_price=previous_by_key.get((team_b_row.market_id, team_b_row.selection), (None, None))[0],
+                current_map_name=match_row.current_map_name or raw.get('current_map_name'),
+                map_score=map_score,
+                round_score=round_score,
+                round_winner_side=live_detail.get('round_winner_side'),
+                live_win_prob_team_a=live_probs.get('team_a'),
+                live_win_prob_team_b=live_probs.get('team_b'),
+                live_win_prob_ot=live_probs.get('ot'),
                 observed_at=max(match_row.observed_at, team_a_row.observed_at, team_b_row.observed_at),
             )
         )
@@ -523,6 +560,7 @@ def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
     table.add_column('Moneyline')
     table.add_column('Move')
     table.add_column('Link')
+    table.add_column('Live ctx')
     table.add_column('Polymarket')
 
     for view in views:
@@ -536,12 +574,20 @@ def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
             delta_b = view.team_b_price - view.team_b_prev_price
             if abs(delta_b) >= 0.0005:
                 move_parts.append(f'{view.team_b} {delta_b:+.3f}')
+        live_ctx_parts: list[str] = []
+        if view.current_map_name:
+            live_ctx_parts.append(str(view.current_map_name))
+        if view.round_score:
+            live_ctx_parts.append(f'round {view.round_score}')
+        if view.live_win_prob_team_a is not None and view.live_win_prob_team_b is not None:
+            live_ctx_parts.append(f'wp {view.team_a} {view.live_win_prob_team_a:.1f}% / {view.team_b} {view.live_win_prob_team_b:.1f}%')
         table.add_row(
             status,
             view.match_title,
             f'{view.team_a} {view.team_a_price:.3f} | {view.team_b} {view.team_b_price:.3f}',
             '; '.join(move_parts) if move_parts else '-',
             f'{view.link_score:.3f}',
+            ' | '.join(live_ctx_parts) if live_ctx_parts else '-',
             view.polymarket_question,
         )
     console.print(table)

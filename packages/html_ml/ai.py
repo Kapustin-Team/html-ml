@@ -17,6 +17,9 @@ Do not invent unavailable facts.
 Use only the provided structured data.
 Be conservative with confidence.
 Prefer PASS over weak bets.
+If live context is present, use it explicitly in reasoning.
+Differentiate between pre-match market price and HLTV live win probability.
+A strong disagreement between live win probability and market price can justify WATCH or small BET, but only when live context is clearly available.
 Schema:
 {
   "action": "BET" | "WATCH" | "PASS",
@@ -64,6 +67,15 @@ class MatchAnalyst:
             'link_score': row.link_score,
             'matched_by': row.matched_by,
             'polymarket_question': row.polymarket_question,
+            'current_map_name': row.current_map_name,
+            'map_score': row.map_score,
+            'round_score': row.round_score,
+            'round_winner_side': row.round_winner_side,
+            'live_win_probability': {
+                'team_a': row.live_win_prob_team_a,
+                'team_b': row.live_win_prob_team_b,
+                'ot': row.live_win_prob_ot,
+            },
         }
         try:
             result = self.client.chat_json(

@@ -24,7 +24,14 @@ class LinkedMarketView:
     team_b_price: float | None
     team_a_prev_price: float | None
     team_b_prev_price: float | None
-    observed_at: datetime
+    current_map_name: str | None = None
+    map_score: str | None = None
+    round_score: str | None = None
+    round_winner_side: str | None = None
+    live_win_prob_team_a: float | None = None
+    live_win_prob_team_b: float | None = None
+    live_win_prob_ot: float | None = None
+    observed_at: datetime = None  # type: ignore[assignment]
 
 
 @dataclass

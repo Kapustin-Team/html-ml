@@ -33,6 +33,7 @@ class HLTVLiveCollector:
         team_a = str(entry.get('team1') or 'TBD')
         team_b = str(entry.get('team2') or 'TBD')
         title = f'{team_a} vs {team_b}'
+        live_detail = entry.get('live_detail') or {}
         return LiveMatchState(
             source='hltv',
             external_match_id=str(entry.get('match_id') or entry.get('href') or title),
@@ -41,14 +42,14 @@ class HLTVLiveCollector:
             team_b=team_b,
             event_name=entry.get('event_name'),
             format=self.normalize_format(entry.get('format')),
-            current_map_name=None,
-            map_index=None,
-            score_team_a=0,
-            score_team_b=0,
-            maps_team_a=0,
-            maps_team_b=0,
-            team_a_side=None,
-            team_b_side=None,
+            current_map_name=live_detail.get('current_map_name'),
+            map_index=live_detail.get('map_index'),
+            score_team_a=live_detail.get('score_team_a') or 0,
+            score_team_b=live_detail.get('score_team_b') or 0,
+            maps_team_a=live_detail.get('maps_team_a') or 0,
+            maps_team_b=live_detail.get('maps_team_b') or 0,
+            team_a_side=live_detail.get('team_a_side'),
+            team_b_side=live_detail.get('team_b_side'),
             raw_payload=entry,
             observed_at=observed,
         )
