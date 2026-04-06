@@ -1,16 +1,57 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from html_ml.models.domain import LiveMatchState
 
 
 class HLTVLiveCollector:
-    """Skeleton collector.
+    """HLTV collector helpers.
 
-    Real implementation will keep a Playwright page open, observe DOM/network
-    updates, normalize them into LiveMatchState snapshots, and persist them.
+    Current stage:
+    - stub live snapshots remain for baseline agent/dev flow
+    - real headed-browser probing/parsing can normalize match list entries
+
+    Next stage:
+    - persistent browser page
+    - per-match live state parsing
+    - DOM/network-driven updates
     """
+
+    @staticmethod
+    def normalize_format(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        lowered = value.strip().lower()
+        if lowered in {'bo1', 'bo3', 'bo5'}:
+            return lowered
+        return lowered or None
+
+    def match_entry_to_state(self, entry: dict, observed_at: Optional[datetime] = None) -> LiveMatchState:
+        observed = observed_at or datetime.now(timezone.utc)
+        team_a = str(entry.get('team1') or 'TBD')
+        team_b = str(entry.get('team2') or 'TBD')
+        title = f'{team_a} vs {team_b}'
+        return LiveMatchState(
+            source='hltv',
+            external_match_id=str(entry.get('match_id') or entry.get('href') or title),
+            match_title=title,
+            team_a=team_a,
+            team_b=team_b,
+            event_name=entry.get('event_name'),
+            format=self.normalize_format(entry.get('format')),
+            current_map_name=None,
+            map_index=None,
+            score_team_a=0,
+            score_team_b=0,
+            maps_team_a=0,
+            maps_team_b=0,
+            team_a_side=None,
+            team_b_side=None,
+            raw_payload=entry,
+            observed_at=observed,
+        )
 
     def collect_once_stub(self) -> list[LiveMatchState]:
         now = datetime.now(timezone.utc)

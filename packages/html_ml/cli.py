@@ -328,6 +328,67 @@ def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles
 
 
 @app.command()
+def probe_hltv(wait_sec: int = 15) -> None:
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'hltv_probe.py'
+    cmd = [sys.executable, str(script), '--wait-sec', str(wait_sec)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        console.print(result.stdout)
+    if result.stderr:
+        console.print(f'[yellow]{result.stderr}[/yellow]')
+    if result.returncode != 0:
+        raise typer.Exit(code=result.returncode)
+
+
+@app.command()
+def collect_hltv_matches(wait_sec: int = 12, limit: int = 20) -> None:
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'hltv_matches_playwright.py'
+    cmd = [sys.executable, str(script), '--wait-sec', str(wait_sec)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if result.stdout:
+            console.print(result.stdout)
+        if result.stderr:
+            console.print(f'[yellow]{result.stderr}[/yellow]')
+        raise typer.Exit(code=result.returncode)
+
+    payload = json.loads(result.stdout)
+    collector = HLTVLiveCollector()
+    rows = [collector.match_entry_to_state(item) for item in payload.get('matches', [])[:limit]]
+
+    init_db()
+    with SessionLocal() as db:
+        for row in rows:
+            save_live_match_snapshot(db, row)
+
+    table = Table(title='HLTV Matches')
+    table.add_column('Match ID')
+    table.add_column('Match')
+    table.add_column('Event')
+    table.add_column('Format')
+    table.add_column('Time')
+    for state in rows:
+        raw = state.raw_payload
+        table.add_row(
+            state.external_match_id,
+            state.match_title,
+            str(state.event_name or '-'),
+            str(state.format or '-'),
+            str(raw.get('time_text') or '-'),
+        )
+    console.print(table)
+    console.print(f'[cyan]Saved HLTV match snapshots:[/cyan] {len(rows)}')
+
+
+@app.command()
 def print_config() -> None:
     from html_ml.config import settings
 
