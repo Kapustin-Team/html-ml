@@ -13,7 +13,7 @@ from rich.table import Table
 from html_ml.agents.baseline import BaselineFlatBetAgent
 from html_ml.collector.hltv import HLTVLiveCollector
 from html_ml.collector.polymarket import PolymarketCollector
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 
 from html_ml.db.repository import save_agent_decision, save_live_match_snapshot, save_odds_snapshot
 from html_ml.db.schema import OddsSnapshotORM, SessionLocal, init_db
@@ -197,16 +197,88 @@ def poll_watchlist(iterations: int = 3, interval_sec: int = 30, limit: int = 10,
             time.sleep(interval_sec)
 
 
+def _latest_previous_prices() -> dict[tuple[str, str], tuple[float, datetime]]:
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(OddsSnapshotORM.market_id, OddsSnapshotORM.selection, OddsSnapshotORM.price, OddsSnapshotORM.observed_at)
+            .order_by(OddsSnapshotORM.market_id, OddsSnapshotORM.selection, desc(OddsSnapshotORM.observed_at))
+        ).all()
+
+    latest: dict[tuple[str, str], tuple[float, datetime]] = {}
+    previous: dict[tuple[str, str], tuple[float, datetime]] = {}
+    for market_id, selection, price, observed_at in rows:
+        key = (str(market_id), str(selection))
+        if key not in latest:
+            latest[key] = (float(price), observed_at)
+        elif key not in previous:
+            previous[key] = (float(price), observed_at)
+    return previous
+
+
+@app.command()
+def market_moves(limit: int = 20) -> None:
+    previous = _latest_previous_prices()
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(
+                OddsSnapshotORM.market_id,
+                OddsSnapshotORM.question,
+                OddsSnapshotORM.selection,
+                OddsSnapshotORM.price,
+                OddsSnapshotORM.observed_at,
+            ).order_by(desc(OddsSnapshotORM.observed_at), desc(OddsSnapshotORM.id))
+        ).all()
+
+    seen: set[tuple[str, str]] = set()
+    moves: list[tuple[float, str, str, float, float, datetime]] = []
+    for market_id, question, selection, price, observed_at in rows:
+        key = (str(market_id), str(selection))
+        if key in seen:
+            continue
+        seen.add(key)
+        if key not in previous:
+            continue
+        prev_price, _ = previous[key]
+        current_price = float(price)
+        delta = current_price - prev_price
+        moves.append((abs(delta), str(question), str(selection), prev_price, current_price, observed_at))
+
+    moves.sort(key=lambda row: row[0], reverse=True)
+
+    table = Table(title='Top Market Moves')
+    table.add_column('Observed (UTC)')
+    table.add_column('Question')
+    table.add_column('Selection')
+    table.add_column('Prev')
+    table.add_column('Now')
+    table.add_column('Delta')
+
+    for _, question, selection, prev_price, current_price, observed_at in moves[:limit]:
+        delta = current_price - prev_price
+        arrow = '↑' if delta > 0 else '↓' if delta < 0 else '→'
+        table.add_row(
+            observed_at.isoformat(timespec='seconds'),
+            question,
+            selection,
+            f'{prev_price:.3f}',
+            f'{current_price:.3f}',
+            f'{arrow} {delta:+.3f}',
+        )
+    console.print(table)
+
+
 @app.command()
 def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles: int = 20) -> None:
     poly = PolymarketCollector()
 
     def build_table() -> Table:
+        previous = _latest_previous_prices()
         matches = poly.top_watch_matches(limit=limit, max_pages=max_pages, only_future=True)
         table = Table(title='html-ml live dashboard')
         table.add_column('End (UTC)')
         table.add_column('Match')
         table.add_column('Moneyline')
+        table.add_column('Move')
         table.add_column('O/U')
         table.add_column('HCAP')
         table.add_column('Score')
@@ -216,12 +288,27 @@ def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles
             moneyline = '-'
             total = '-'
             handicap = '-'
+            move = '-'
 
             if match.match_market and len(match.match_market.outcomes) >= 2 and len(match.match_market.prices) >= 2:
                 moneyline = (
                     f"{match.match_market.outcomes[0]} {match.match_market.prices[0]:.3f} | "
                     f"{match.match_market.outcomes[1]} {match.match_market.prices[1]:.3f}"
                 )
+                deltas: list[str] = []
+                market_id = f'{match.event_id}:match_winner:{match.match_market.question}'
+                for outcome, price in zip(match.match_market.outcomes, match.match_market.prices):
+                    prev = previous.get((market_id, str(outcome)))
+                    if prev is None:
+                        continue
+                    prev_price, _ = prev
+                    delta = float(price) - prev_price
+                    if abs(delta) < 0.0005:
+                        continue
+                    arrow = '↑' if delta > 0 else '↓'
+                    deltas.append(f'{outcome} {arrow}{delta:+.3f}')
+                if deltas:
+                    move = '; '.join(deltas)
             if match.total_market and len(match.total_market.prices) >= 2:
                 total = f"{match.total_market.prices[0]:.3f} / {match.total_market.prices[1]:.3f}"
             if match.handicap_market and len(match.handicap_market.outcomes) >= 2 and len(match.handicap_market.prices) >= 2:
@@ -230,7 +317,7 @@ def dashboard(limit: int = 10, max_pages: int = 5, refresh_sec: int = 15, cycles
                     f"{match.handicap_market.outcomes[1]} {match.handicap_market.prices[1]:.3f}"
                 )
 
-            table.add_row(end_at, match.title, moneyline, total, handicap, f'{match.score:.2f}')
+            table.add_row(end_at, match.title, moneyline, move, total, handicap, f'{match.score:.2f}')
 
         return table
 
