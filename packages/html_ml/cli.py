@@ -10,8 +10,10 @@ from rich.table import Table
 from html_ml.agents.baseline import BaselineFlatBetAgent
 from html_ml.collector.hltv import HLTVLiveCollector
 from html_ml.collector.polymarket import PolymarketCollector
+from sqlalchemy import func, select
+
 from html_ml.db.repository import save_agent_decision, save_live_match_snapshot, save_odds_snapshot
-from html_ml.db.schema import SessionLocal, init_db
+from html_ml.db.schema import OddsSnapshotORM, SessionLocal, init_db
 from html_ml.models.domain import AggressionProfile
 
 app = typer.Typer(no_args_is_help=True)
@@ -115,6 +117,24 @@ def run_baseline(aggression: AggressionProfile = AggressionProfile.BALANCED) -> 
         table.add_row(d.agent_name, d.aggression.value, d.selection, d.action, f'${d.stake_usd:.2f}', f'{d.confidence:.2f}')
 
     console.print(table)
+
+
+@app.command()
+def db_summary() -> None:
+    init_db()
+    with SessionLocal() as db:
+        total_snapshots = db.scalar(select(func.count()).select_from(OddsSnapshotORM)) or 0
+        by_market_type = db.execute(
+            select(OddsSnapshotORM.market_type, func.count()).group_by(OddsSnapshotORM.market_type)
+        ).all()
+
+    table = Table(title='Odds Snapshot Summary')
+    table.add_column('Market Type')
+    table.add_column('Count')
+    for market_type, count in by_market_type:
+        table.add_row(str(market_type), str(count))
+    console.print(table)
+    console.print(f'[cyan]Total odds snapshots:[/cyan] {total_snapshots}')
 
 
 @app.command()
