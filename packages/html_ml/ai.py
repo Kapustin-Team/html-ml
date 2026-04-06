@@ -76,6 +76,12 @@ class MatchAnalyst:
                 'team_b': row.live_win_prob_team_b,
                 'ot': row.live_win_prob_ot,
             },
+            'market_momentum': {
+                'team_a': row.team_a_momentum,
+                'team_b': row.team_b_momentum,
+                'tightness': row.market_tightness,
+                'bias': row.market_bias,
+            },
         }
         try:
             result = self.client.chat_json(

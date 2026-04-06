@@ -12,6 +12,9 @@ import typer
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+from rich.panel import Panel
+from rich.columns import Columns
+from rich.text import Text
 
 from html_ml.agents.baseline import BaselineFlatBetAgent
 from html_ml.collector.hltv import HLTVLiveCollector
@@ -27,6 +30,37 @@ from html_ml.signals import LinkedMarketView, build_candidate_bets
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+
+def _print_banner(title: str, subtitle: str | None = None) -> None:
+    body = title if not subtitle else f'{title}\n[dim]{subtitle}[/dim]'
+    console.print(Panel.fit(body, border_style='cyan'))
+
+
+def _print_step(step: str, message: str) -> None:
+    console.print(f'\n[bold cyan]{step}[/bold cyan] {message}')
+
+
+def _compact_live_context(view: LinkedMarketView) -> str:
+    parts: list[str] = []
+    if view.current_map_name:
+        parts.append(str(view.current_map_name))
+    if view.round_score:
+        parts.append(f'round {view.round_score}')
+    if view.live_win_prob_team_a is not None and view.live_win_prob_team_b is not None:
+        parts.append(f'wp {view.team_a} {view.live_win_prob_team_a:.1f}% / {view.team_b} {view.live_win_prob_team_b:.1f}%')
+    return ' | '.join(parts) if parts else '-'
+
+
+def _compact_momentum(view: LinkedMarketView) -> str:
+    parts: list[str] = []
+    if view.team_a_momentum is not None:
+        parts.append(f'{view.team_a} {view.team_a_momentum:+.3f}')
+    if view.team_b_momentum is not None:
+        parts.append(f'{view.team_b} {view.team_b_momentum:+.3f}')
+    if view.market_bias:
+        parts.append(f'bias {view.market_bias}')
+    return ' | '.join(parts) if parts else '-'
 
 
 @app.command()
@@ -219,6 +253,32 @@ def _latest_previous_prices() -> dict[tuple[str, str], tuple[float, datetime]]:
         elif key not in previous:
             previous[key] = (float(price), observed_at)
     return previous
+
+
+def _market_momentum_index(max_points: int = 6) -> dict[tuple[str, str], list[float]]:
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(OddsSnapshotORM.market_id, OddsSnapshotORM.selection, OddsSnapshotORM.price, OddsSnapshotORM.observed_at)
+            .where(OddsSnapshotORM.source == 'polymarket')
+            .order_by(OddsSnapshotORM.market_id, OddsSnapshotORM.selection, desc(OddsSnapshotORM.observed_at), desc(OddsSnapshotORM.id))
+            .limit(8000)
+        ).all()
+
+    grouped: dict[tuple[str, str], list[float]] = {}
+    for market_id, selection, price, _ in rows:
+        key = (str(market_id), str(selection))
+        bucket = grouped.setdefault(key, [])
+        if len(bucket) < max_points:
+            bucket.append(float(price))
+    return grouped
+
+
+def _compute_momentum(prices_desc: list[float]) -> float | None:
+    if len(prices_desc) < 2:
+        return None
+    newest = prices_desc[0]
+    oldest = prices_desc[-1]
+    return newest - oldest
 
 
 @app.command()
@@ -470,6 +530,7 @@ def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView
         odds_by_market.setdefault(row.market_id, []).append(row)
 
     previous_by_key = _latest_previous_prices()
+    momentum_by_key = _market_momentum_index()
     views: list[LinkedMarketView] = []
     for link in links:
         match_row = latest_hltv_by_match.get(link.hltv_match_id)
@@ -498,6 +559,15 @@ def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView
         round_score = None
         if live_detail.get('score_team_a') is not None and live_detail.get('score_team_b') is not None:
             round_score = f"{live_detail.get('score_team_a')}-{live_detail.get('score_team_b')}"
+        team_a_momentum = _compute_momentum(momentum_by_key.get((team_a_row.market_id, team_a_row.selection), []))
+        team_b_momentum = _compute_momentum(momentum_by_key.get((team_b_row.market_id, team_b_row.selection), []))
+        market_tightness = 1.0 - abs(float(team_a_row.price) - float(team_b_row.price))
+        market_bias = None
+        if team_a_momentum is not None and team_b_momentum is not None:
+            if team_a_momentum < team_b_momentum:
+                market_bias = match_row.team_a
+            elif team_b_momentum < team_a_momentum:
+                market_bias = match_row.team_b
         views.append(
             LinkedMarketView(
                 hltv_match_id=match_row.external_match_id,
@@ -523,6 +593,10 @@ def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView
                 live_win_prob_team_a=live_probs.get('team_a'),
                 live_win_prob_team_b=live_probs.get('team_b'),
                 live_win_prob_ot=live_probs.get('ot'),
+                team_a_momentum=team_a_momentum,
+                team_b_momentum=team_b_momentum,
+                market_tightness=market_tightness,
+                market_bias=market_bias,
                 observed_at=max(match_row.observed_at, team_a_row.observed_at, team_b_row.observed_at),
             )
         )
@@ -561,6 +635,7 @@ def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
     table.add_column('Move')
     table.add_column('Link')
     table.add_column('Live ctx')
+    table.add_column('Momentum')
     table.add_column('Polymarket')
 
     for view in views:
@@ -581,6 +656,13 @@ def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
             live_ctx_parts.append(f'round {view.round_score}')
         if view.live_win_prob_team_a is not None and view.live_win_prob_team_b is not None:
             live_ctx_parts.append(f'wp {view.team_a} {view.live_win_prob_team_a:.1f}% / {view.team_b} {view.live_win_prob_team_b:.1f}%')
+        momentum_parts: list[str] = []
+        if view.team_a_momentum is not None:
+            momentum_parts.append(f'{view.team_a} {view.team_a_momentum:+.3f}')
+        if view.team_b_momentum is not None:
+            momentum_parts.append(f'{view.team_b} {view.team_b_momentum:+.3f}')
+        if view.market_bias:
+            momentum_parts.append(f'bias {view.market_bias}')
         table.add_row(
             status,
             view.match_title,
@@ -588,6 +670,7 @@ def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
             '; '.join(move_parts) if move_parts else '-',
             f'{view.link_score:.3f}',
             ' | '.join(live_ctx_parts) if live_ctx_parts else '-',
+            ' | '.join(momentum_parts) if momentum_parts else '-',
             view.polymarket_question,
         )
     console.print(table)
@@ -627,9 +710,14 @@ def _print_ai_bets(results: list) -> None:
     table.add_column('Stake %')
     table.add_column('Summary')
     for item in results:
+        action_style = {
+            'BET': '[green]BET[/green]',
+            'WATCH': '[yellow]WATCH[/yellow]',
+            'PASS': '[dim]PASS[/dim]',
+        }.get(item.action, item.action)
         table.add_row(
             item.match_title,
-            item.action,
+            action_style,
             item.selection or '-',
             f'{item.confidence:.2f}',
             f'{item.stake_fraction:.2%}',
@@ -637,15 +725,23 @@ def _print_ai_bets(results: list) -> None:
         )
     console.print(table)
 
+    cards = []
     for item in results:
-        console.print(f'\n[bold]{item.match_title}[/bold]')
-        if item.reasoning:
-            for reason in item.reasoning:
-                console.print(f'• {reason}')
+        lines: list[str] = []
+        lines.append(f'[bold]{item.action}[/bold]  {item.selection or "-"}')
+        lines.append(f'conf {item.confidence:.2f} • stake {item.stake_fraction:.2%}')
+        lines.append('')
+        for reason in (item.reasoning or [])[:4]:
+            lines.append(f'• {reason}')
         if item.risk_flags:
-            console.print(f'[yellow]Risk flags:[/yellow] ' + '; '.join(item.risk_flags))
+            lines.append('')
+            lines.append('[yellow]Risk:[/yellow] ' + '; '.join(item.risk_flags))
         if getattr(item, 'error', None):
-            console.print(f'[dim]LLM error: {item.error}[/dim]')
+            lines.append(f'[dim]LLM error: {item.error}[/dim]')
+        border = 'green' if item.action == 'BET' else 'yellow' if item.action == 'WATCH' else 'dim'
+        cards.append(Panel('\n'.join(lines), title=item.match_title, border_style=border))
+    if cards:
+        console.print(Columns(cards))
 
 
 @app.command()
@@ -659,6 +755,64 @@ def ai_bets(
     analyst = MatchAnalyst(api_key=api_key or None, model=model or None)
     results = [analyst.analyze(view) for view in views]
     _print_ai_bets(results)
+
+
+@app.command()
+def live_match_test(
+    limit: int = 5,
+    wait_sec: int = 8,
+    pages: int = 2,
+    poll_cycles: int = 1,
+    poll_interval_sec: int = 45,
+    min_link_score: float = 0.72,
+    api_key: str = typer.Option('', help='Optional OpenRouter API key override for this run.'),
+    model: str = typer.Option('', help='Optional OpenRouter model override.'),
+) -> None:
+    _print_banner('html-ml live match test', 'Current live matches → linked markets → AI call')
+    _print_step('Step 1/4', 'Collecting current live HLTV matches...')
+    collect_hltv_matches(wait_sec=wait_sec, limit=max(limit * 2, 8))
+    _print_step('Step 2/4', 'Refreshing Polymarket odds...')
+    collect_polymarket(max_pages=pages)
+    if poll_cycles > 1:
+        _print_step('Step 3/4', f'Building short-term price history: {poll_cycles} cycles × {poll_interval_sec}s')
+        with console.status('[bold cyan]Polling watchlist for momentum...[/bold cyan]', spinner='dots'):
+            poll_watchlist(iterations=poll_cycles, interval_sec=poll_interval_sec, limit=max(limit * 2, 8), max_pages=pages)
+    else:
+        _print_step('Step 3/4', 'Skipping extra polling, using current snapshots only')
+
+    _print_step('Step 4/4', 'Building live linked shortlist and running AI analysis...')
+    all_views = _build_linked_market_views(min_score=min_link_score)
+    live_views = [view for view in all_views if view.live][:limit]
+
+    table = Table(title='Current live linked matches')
+    table.add_column('Match')
+    table.add_column('Moneyline')
+    table.add_column('Live ctx')
+    table.add_column('Momentum')
+    table.add_column('Link')
+    for view in live_views:
+        table.add_row(
+            view.match_title,
+            f'{view.team_a} {view.team_a_price:.3f} | {view.team_b} {view.team_b_price:.3f}',
+            _compact_live_context(view),
+            _compact_momentum(view),
+            f'{view.link_score:.3f}',
+        )
+    console.print(table)
+
+    analyst = MatchAnalyst(api_key=api_key or None, model=model or None)
+    results = [analyst.analyze(view) for view in live_views]
+    _print_ai_bets(results)
+
+    next_steps = Panel(
+        '• Save this snapshot for 1–3 live matches\n'
+        '• Re-run in 5–10 minutes or use poll_cycles > 1\n'
+        '• Compare AI action changes vs price and live probability\n'
+        '• Mark each read as good / neutral / bad',
+        title='How to test right now',
+        border_style='green',
+    )
+    console.print(next_steps)
 
 
 @app.command()

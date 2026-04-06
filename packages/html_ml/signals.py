@@ -31,6 +31,10 @@ class LinkedMarketView:
     live_win_prob_team_a: float | None = None
     live_win_prob_team_b: float | None = None
     live_win_prob_ot: float | None = None
+    team_a_momentum: float | None = None
+    team_b_momentum: float | None = None
+    market_tightness: float | None = None
+    market_bias: str | None = None
     observed_at: datetime = None  # type: ignore[assignment]
 
 
