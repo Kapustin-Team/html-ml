@@ -192,8 +192,6 @@ class PolymarketCollector:
 
     def build_watch_match(self, event: dict[str, Any]) -> Optional[WatchMatch]:
         title = str(event.get('title') or '').strip()
-        if 'Counter-Strike:' not in title:
-            return None
 
         match_market: Optional[WatchMarket] = None
         total_market: Optional[WatchMarket] = None
@@ -204,12 +202,21 @@ class PolymarketCollector:
             normalized = self._to_watch_market(market)
             if normalized is None:
                 continue
-            if question.startswith('Counter-Strike:') and 'Map ' not in question:
+            lowered = question.lower()
+            if (' vs ' in lowered or ' versus ' in lowered or ' beat ' in lowered) and 'map ' not in lowered and 'total' not in lowered and 'handicap' not in lowered:
                 match_market = normalized
-            elif question.startswith('Games Total:'):
+                if not title:
+                    title = question
+            elif question.startswith('Games Total:') or 'total maps' in lowered or 'games total' in lowered:
                 total_market = normalized
-            elif question.startswith('Map Handicap:'):
+            elif question.startswith('Map Handicap:') or 'handicap' in lowered:
                 handicap_market = normalized
+
+        if match_market is None:
+            return None
+
+        if not title:
+            title = match_market.question
 
         return WatchMatch(
             event_id=str(event.get('id')),
@@ -272,11 +279,38 @@ class PolymarketCollector:
                     )
         return snapshots
 
-    def collect_cs2_market_snapshots(self, max_pages: int = 5) -> list[OddsSnapshot]:
+    def collect_cs2_market_snapshots(self, max_pages: int = 5, only_future: bool = False) -> list[OddsSnapshot]:
+        observed_at = datetime.now(timezone.utc)
         snapshots: list[OddsSnapshot] = []
-        for event in self.iter_cs2_events(max_pages=max_pages):
-            for market in event.get('markets') or []:
-                snapshots.extend(self.normalize_market(market))
+        matches = self.list_watch_matches(max_pages=max_pages, only_future=only_future)
+        for match in matches:
+            for market_type, watch_market in (
+                (MarketType.MATCH_WINNER, match.match_market),
+                (MarketType.MAP_TOTALS, match.total_market),
+                (MarketType.MAP_HANDICAP, match.handicap_market),
+            ):
+                if watch_market is None:
+                    continue
+                for outcome, price in zip(watch_market.outcomes, watch_market.prices):
+                    snapshots.append(
+                        OddsSnapshot(
+                            source='polymarket',
+                            market_id=f'{match.event_id}:{market_type.value}:{watch_market.question}',
+                            question=watch_market.question,
+                            market_type=market_type,
+                            selection=str(outcome),
+                            price=float(price),
+                            implied_probability=float(price),
+                            observed_at=observed_at,
+                            raw_payload={
+                                'event_id': match.event_id,
+                                'slug': match.slug,
+                                'title': match.title,
+                                'end_at': match.end_at.isoformat() if match.end_at else None,
+                                'watch_score': match.score,
+                            },
+                        )
+                    )
         return snapshots
 
     def collect_once_stub(self) -> list[OddsSnapshot]:
