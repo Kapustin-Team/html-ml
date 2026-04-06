@@ -1,6 +1,0 @@
-agents
-collector
-core
-db
-html_ml
-simulator
