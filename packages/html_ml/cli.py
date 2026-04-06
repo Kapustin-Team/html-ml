@@ -17,8 +17,10 @@ from sqlalchemy import desc, func, select
 
 from html_ml.db.repository import save_agent_decision, save_live_match_snapshot, save_odds_snapshot
 from html_ml.db.schema import LiveMatchSnapshotORM, OddsSnapshotORM, SessionLocal, init_db
+from html_ml.ai import MatchAnalyst
 from html_ml.linker import HltvMatchRow, PolymarketRow, link_hltv_to_polymarket
 from html_ml.models.domain import AggressionProfile
+from html_ml.signals import LinkedMarketView, build_candidate_bets
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -389,21 +391,20 @@ def collect_hltv_matches(wait_sec: int = 12, limit: int = 20) -> None:
     console.print(f'[cyan]Saved HLTV match snapshots:[/cyan] {len(rows)}')
 
 
-@app.command()
-def link_markets(limit: int = 15, min_score: float = 0.72) -> None:
+def _load_link_context(min_score: float = 0.72) -> tuple[list[LiveMatchSnapshotORM], list[OddsSnapshotORM], list]:
     init_db()
     with SessionLocal() as db:
         latest_hltv_rows = db.execute(
             select(LiveMatchSnapshotORM)
             .where(LiveMatchSnapshotORM.source == 'hltv')
-            .order_by(LiveMatchSnapshotORM.observed_at.desc(), desc(LiveMatchSnapshotORM.id))
+            .order_by(desc(LiveMatchSnapshotORM.observed_at), desc(LiveMatchSnapshotORM.id))
             .limit(200)
         ).scalars().all()
         latest_odds_rows = db.execute(
             select(OddsSnapshotORM)
             .where(OddsSnapshotORM.source == 'polymarket')
-            .order_by(OddsSnapshotORM.observed_at.desc(), desc(OddsSnapshotORM.id))
-            .limit(1000)
+            .order_by(desc(OddsSnapshotORM.observed_at), desc(OddsSnapshotORM.id))
+            .limit(2000)
         ).scalars().all()
 
     dedup_hltv: dict[str, HltvMatchRow] = {}
@@ -432,15 +433,76 @@ def link_markets(limit: int = 15, min_score: float = 0.72) -> None:
             ),
         )
 
-    links = link_hltv_to_polymarket(dedup_hltv.values(), dedup_pm.values(), min_score=min_score)[:limit]
+    links = link_hltv_to_polymarket(dedup_hltv.values(), dedup_pm.values(), min_score=min_score)
+    return latest_hltv_rows, latest_odds_rows, links
 
+
+def _build_linked_market_views(min_score: float = 0.72) -> list[LinkedMarketView]:
+    latest_hltv_rows, latest_odds_rows, links = _load_link_context(min_score=min_score)
+    latest_hltv_by_match: dict[str, LiveMatchSnapshotORM] = {}
+    for row in latest_hltv_rows:
+        latest_hltv_by_match.setdefault(row.external_match_id, row)
+
+    odds_by_market: dict[str, list[OddsSnapshotORM]] = {}
+    for row in latest_odds_rows:
+        odds_by_market.setdefault(row.market_id, []).append(row)
+
+    previous_by_key = _latest_previous_prices()
+    views: list[LinkedMarketView] = []
+    for link in links:
+        match_row = latest_hltv_by_match.get(link.hltv_match_id)
+        market_rows = odds_by_market.get(link.polymarket_market_id, [])
+        if match_row is None or not market_rows:
+            continue
+
+        latest_by_selection: dict[str, OddsSnapshotORM] = {}
+        for row in market_rows:
+            latest_by_selection.setdefault(row.selection, row)
+
+        team_a_row = latest_by_selection.get(match_row.team_a)
+        team_b_row = latest_by_selection.get(match_row.team_b)
+        if team_a_row is None or team_b_row is None:
+            team_a_row = market_rows[0] if market_rows else None
+            team_b_row = market_rows[1] if len(market_rows) > 1 else None
+        if team_a_row is None or team_b_row is None:
+            continue
+
+        raw = match_row.raw_payload or {}
+        views.append(
+            LinkedMarketView(
+                hltv_match_id=match_row.external_match_id,
+                match_title=match_row.match_title,
+                event_name=match_row.event_name,
+                format=match_row.format,
+                live=bool(raw.get('live')),
+                time_text=raw.get('time_text'),
+                polymarket_market_id=link.polymarket_market_id,
+                polymarket_question=link.polymarket_question,
+                link_score=link.score,
+                matched_by=link.matched_by,
+                team_a=match_row.team_a,
+                team_b=match_row.team_b,
+                team_a_price=float(team_a_row.price),
+                team_b_price=float(team_b_row.price),
+                team_a_prev_price=previous_by_key.get((team_a_row.market_id, team_a_row.selection), (None, None))[0],
+                team_b_prev_price=previous_by_key.get((team_b_row.market_id, team_b_row.selection), (None, None))[0],
+                observed_at=max(match_row.observed_at, team_a_row.observed_at, team_b_row.observed_at),
+            )
+        )
+    views.sort(key=lambda item: (item.live, item.link_score), reverse=True)
+    return views
+
+
+@app.command()
+def link_markets(limit: int = 15, min_score: float = 0.72) -> None:
+    _, _, links = _load_link_context(min_score=min_score)
     table = Table(title='HLTV ↔ Polymarket Links')
     table.add_column('HLTV Match ID')
     table.add_column('Match')
     table.add_column('Polymarket')
     table.add_column('Score')
     table.add_column('Method')
-    for link in links:
+    for link in links[:limit]:
         table.add_row(
             link.hltv_match_id,
             link.hltv_match_title,
@@ -449,7 +511,144 @@ def link_markets(limit: int = 15, min_score: float = 0.72) -> None:
             link.matched_by,
         )
     console.print(table)
-    console.print(f'[cyan]Links found:[/cyan] {len(links)}')
+    console.print(f'[cyan]Links found:[/cyan] {len(links[:limit])}')
+
+
+@app.command()
+def linked_dashboard(limit: int = 12, min_score: float = 0.68) -> None:
+    views = _build_linked_market_views(min_score=min_score)[:limit]
+    table = Table(title='html-ml linked dashboard')
+    table.add_column('Status')
+    table.add_column('Match')
+    table.add_column('Moneyline')
+    table.add_column('Move')
+    table.add_column('Link')
+    table.add_column('Polymarket')
+
+    for view in views:
+        status = 'LIVE' if view.live else (view.time_text or '-')
+        move_parts: list[str] = []
+        if view.team_a_prev_price is not None:
+            delta_a = view.team_a_price - view.team_a_prev_price
+            if abs(delta_a) >= 0.0005:
+                move_parts.append(f'{view.team_a} {delta_a:+.3f}')
+        if view.team_b_prev_price is not None:
+            delta_b = view.team_b_price - view.team_b_prev_price
+            if abs(delta_b) >= 0.0005:
+                move_parts.append(f'{view.team_b} {delta_b:+.3f}')
+        table.add_row(
+            status,
+            view.match_title,
+            f'{view.team_a} {view.team_a_price:.3f} | {view.team_b} {view.team_b_price:.3f}',
+            '; '.join(move_parts) if move_parts else '-',
+            f'{view.link_score:.3f}',
+            view.polymarket_question,
+        )
+    console.print(table)
+    console.print(f'[cyan]Rows:[/cyan] {len(views)}')
+
+
+@app.command()
+def candidate_bets(limit: int = 10, min_link_score: float = 0.68) -> None:
+    views = _build_linked_market_views(min_score=min_link_score)
+    candidates = build_candidate_bets(views, min_link_score=min_link_score)[:limit]
+    table = Table(title='Candidate Bets')
+    table.add_column('Match')
+    table.add_column('Pick')
+    table.add_column('Price')
+    table.add_column('Edge')
+    table.add_column('Conf')
+    table.add_column('Reason')
+    for item in candidates:
+        table.add_row(
+            item.match_title,
+            item.selection,
+            f'{item.price:.3f}',
+            f'{item.edge_score:.3f}',
+            f'{item.confidence:.3f}',
+            item.reason,
+        )
+    console.print(table)
+    console.print(f'[cyan]Candidates:[/cyan] {len(candidates)}')
+
+
+def _print_ai_bets(results: list) -> None:
+    table = Table(title='AI Bets')
+    table.add_column('Match')
+    table.add_column('Action')
+    table.add_column('Pick')
+    table.add_column('Conf')
+    table.add_column('Stake %')
+    table.add_column('Summary')
+    for item in results:
+        table.add_row(
+            item.match_title,
+            item.action,
+            item.selection or '-',
+            f'{item.confidence:.2f}',
+            f'{item.stake_fraction:.2%}',
+            item.summary,
+        )
+    console.print(table)
+
+    for item in results:
+        console.print(f'\n[bold]{item.match_title}[/bold]')
+        if item.reasoning:
+            for reason in item.reasoning:
+                console.print(f'• {reason}')
+        if item.risk_flags:
+            console.print(f'[yellow]Risk flags:[/yellow] ' + '; '.join(item.risk_flags))
+        if getattr(item, 'error', None):
+            console.print(f'[dim]LLM error: {item.error}[/dim]')
+
+
+@app.command()
+def ai_bets(
+    limit: int = 5,
+    min_link_score: float = 0.7,
+    api_key: str = typer.Option('', help='Optional OpenRouter API key override for this run.'),
+    model: str = typer.Option('', help='Optional OpenRouter model override.'),
+) -> None:
+    views = _build_linked_market_views(min_score=min_link_score)[:limit]
+    analyst = MatchAnalyst(api_key=api_key or None, model=model or None)
+    results = [analyst.analyze(view) for view in views]
+    _print_ai_bets(results)
+
+
+@app.command()
+def live_bets(
+    hltv_limit: int = 20,
+    pages: int = 5,
+    linked_limit: int = 10,
+    ai_limit: int = 5,
+    wait_sec: int = 8,
+    min_link_score: float = 0.7,
+    api_key: str = typer.Option('', help='Optional OpenRouter API key override for this run.'),
+    model: str = typer.Option('', help='Optional OpenRouter model override.'),
+) -> None:
+    console.print('[bold cyan]Step 1/4[/bold cyan] Collecting HLTV matches...')
+    collect_hltv_matches(wait_sec=wait_sec, limit=hltv_limit)
+
+    console.print('\n[bold cyan]Step 2/4[/bold cyan] Collecting Polymarket odds...')
+    collect_polymarket(max_pages=pages)
+
+    console.print('\n[bold cyan]Step 3/4[/bold cyan] Building linked dashboard...')
+    linked_dashboard(limit=linked_limit, min_score=min_link_score)
+
+    console.print('\n[bold cyan]Step 4/4[/bold cyan] Running AI analysis...')
+    views = _build_linked_market_views(min_score=min_link_score)[:ai_limit]
+    analyst = MatchAnalyst(api_key=api_key or None, model=model or None)
+    results = [analyst.analyze(view) for view in views]
+    _print_ai_bets(results)
+
+    bet_count = sum(1 for item in results if item.action == 'BET')
+    watch_count = sum(1 for item in results if item.action == 'WATCH')
+    pass_count = sum(1 for item in results if item.action == 'PASS')
+    console.print('\n[bold green]Summary[/bold green]')
+    console.print(f'• Linked matches analyzed: {len(views)}')
+    console.print(f'• BET: {bet_count}')
+    console.print(f'• WATCH: {watch_count}')
+    console.print(f'• PASS: {pass_count}')
 
 
 @app.command()

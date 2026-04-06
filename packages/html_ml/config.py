@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,9 @@ class Settings(BaseSettings):
     collector_poll_seconds: float = 5.0
     browser_headless: bool = False
     data_dir: Path = Field(default=Path('data'))
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = 'https://openrouter.ai/api/v1'
+    openrouter_model: str = 'openai/gpt-4.1-mini'
 
 
 settings = Settings()
