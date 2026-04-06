@@ -59,6 +59,17 @@ class OddsSnapshot(BaseModel):
     raw_payload: dict = Field(default_factory=dict)
 
 
+class MatchLink(BaseModel):
+    hltv_match_id: str
+    hltv_match_title: str
+    polymarket_market_id: str
+    polymarket_question: str
+    score: float
+    matched_by: str
+    observed_at: datetime
+    raw_payload: dict = Field(default_factory=dict)
+
+
 class AgentDecision(BaseModel):
     agent_name: str
     model_name: str

@@ -16,7 +16,8 @@ from html_ml.collector.polymarket import PolymarketCollector
 from sqlalchemy import desc, func, select
 
 from html_ml.db.repository import save_agent_decision, save_live_match_snapshot, save_odds_snapshot
-from html_ml.db.schema import OddsSnapshotORM, SessionLocal, init_db
+from html_ml.db.schema import LiveMatchSnapshotORM, OddsSnapshotORM, SessionLocal, init_db
+from html_ml.linker import HltvMatchRow, PolymarketRow, link_hltv_to_polymarket
 from html_ml.models.domain import AggressionProfile
 
 app = typer.Typer(no_args_is_help=True)
@@ -386,6 +387,69 @@ def collect_hltv_matches(wait_sec: int = 12, limit: int = 20) -> None:
         )
     console.print(table)
     console.print(f'[cyan]Saved HLTV match snapshots:[/cyan] {len(rows)}')
+
+
+@app.command()
+def link_markets(limit: int = 15, min_score: float = 0.72) -> None:
+    init_db()
+    with SessionLocal() as db:
+        latest_hltv_rows = db.execute(
+            select(LiveMatchSnapshotORM)
+            .where(LiveMatchSnapshotORM.source == 'hltv')
+            .order_by(LiveMatchSnapshotORM.observed_at.desc(), desc(LiveMatchSnapshotORM.id))
+            .limit(200)
+        ).scalars().all()
+        latest_odds_rows = db.execute(
+            select(OddsSnapshotORM)
+            .where(OddsSnapshotORM.source == 'polymarket')
+            .order_by(OddsSnapshotORM.observed_at.desc(), desc(OddsSnapshotORM.id))
+            .limit(1000)
+        ).scalars().all()
+
+    dedup_hltv: dict[str, HltvMatchRow] = {}
+    for row in latest_hltv_rows:
+        dedup_hltv.setdefault(
+            row.external_match_id,
+            HltvMatchRow(
+                match_id=row.external_match_id,
+                match_title=row.match_title,
+                team_a=row.team_a,
+                team_b=row.team_b,
+                event_name=row.event_name,
+                observed_at=row.observed_at,
+            ),
+        )
+
+    dedup_pm: dict[str, PolymarketRow] = {}
+    for row in latest_odds_rows:
+        dedup_pm.setdefault(
+            row.market_id,
+            PolymarketRow(
+                market_id=row.market_id,
+                question=row.question,
+                market_type=row.market_type,
+                observed_at=row.observed_at,
+            ),
+        )
+
+    links = link_hltv_to_polymarket(dedup_hltv.values(), dedup_pm.values(), min_score=min_score)[:limit]
+
+    table = Table(title='HLTV ↔ Polymarket Links')
+    table.add_column('HLTV Match ID')
+    table.add_column('Match')
+    table.add_column('Polymarket')
+    table.add_column('Score')
+    table.add_column('Method')
+    for link in links:
+        table.add_row(
+            link.hltv_match_id,
+            link.hltv_match_title,
+            link.polymarket_question,
+            f'{link.score:.3f}',
+            link.matched_by,
+        )
+    console.print(table)
+    console.print(f'[cyan]Links found:[/cyan] {len(links)}')
 
 
 @app.command()
