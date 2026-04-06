@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
+from pydantic import BaseModel
+
 import httpx
 
 from html_ml.config import settings
@@ -17,6 +19,37 @@ DEFAULT_HEADERS = {
 }
 
 CS2_TAG_ID = 100780
+
+
+class WatchMarket(BaseModel):
+    question: str
+    outcomes: list[str]
+    prices: list[float]
+
+
+class WatchMatch(BaseModel):
+    event_id: str
+    slug: Optional[str] = None
+    title: str
+    start_at: Optional[datetime] = None
+    end_at: Optional[datetime] = None
+    match_market: Optional[WatchMarket] = None
+    total_market: Optional[WatchMarket] = None
+    handicap_market: Optional[WatchMarket] = None
+
+    @property
+    def score(self) -> float:
+        score = 0.0
+        if self.match_market and len(self.match_market.prices) >= 2:
+            spread = abs(self.match_market.prices[0] - self.match_market.prices[1])
+            score += 1.0 - min(spread, 1.0)
+        if self.total_market and len(self.total_market.prices) >= 2:
+            total_spread = abs(self.total_market.prices[0] - self.total_market.prices[1])
+            score += 1.0 - min(total_spread, 1.0)
+        if self.handicap_market and len(self.handicap_market.prices) >= 2:
+            handicap_spread = abs(self.handicap_market.prices[0] - self.handicap_market.prices[1])
+            score += 1.0 - min(handicap_spread, 1.0)
+        return score
 
 
 class PolymarketCollector:
@@ -128,6 +161,78 @@ class PolymarketCollector:
                 )
             )
         return snapshots
+
+    @staticmethod
+    def _parse_dt(value: Any) -> Optional[datetime]:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    def _to_watch_market(self, market: dict[str, Any]) -> Optional[WatchMarket]:
+        outcomes_raw = self._parse_jsonish_list(market.get('outcomes'))
+        prices_raw = self._parse_jsonish_list(market.get('outcomePrices'))
+        if not outcomes_raw or not prices_raw:
+            return None
+
+        prices: list[float] = []
+        for price in prices_raw:
+            try:
+                prices.append(float(price))
+            except (TypeError, ValueError):
+                return None
+
+        return WatchMarket(
+            question=str(market.get('question') or ''),
+            outcomes=[str(x) for x in outcomes_raw],
+            prices=prices,
+        )
+
+    def build_watch_match(self, event: dict[str, Any]) -> Optional[WatchMatch]:
+        title = str(event.get('title') or '').strip()
+        if 'Counter-Strike:' not in title:
+            return None
+
+        match_market: Optional[WatchMarket] = None
+        total_market: Optional[WatchMarket] = None
+        handicap_market: Optional[WatchMarket] = None
+
+        for market in event.get('markets') or []:
+            question = str(market.get('question') or '')
+            normalized = self._to_watch_market(market)
+            if normalized is None:
+                continue
+            if question.startswith('Counter-Strike:') and 'Map ' not in question:
+                match_market = normalized
+            elif question.startswith('Games Total:'):
+                total_market = normalized
+            elif question.startswith('Map Handicap:'):
+                handicap_market = normalized
+
+        return WatchMatch(
+            event_id=str(event.get('id')),
+            slug=event.get('slug'),
+            title=title,
+            start_at=self._parse_dt(event.get('startDate')),
+            end_at=self._parse_dt(event.get('endDate')),
+            match_market=match_market,
+            total_market=total_market,
+            handicap_market=handicap_market,
+        )
+
+    def list_watch_matches(self, max_pages: int = 5, only_future: bool = True) -> list[WatchMatch]:
+        now = datetime.now(timezone.utc)
+        matches: list[WatchMatch] = []
+        for event in self.iter_cs2_events(max_pages=max_pages):
+            watch_match = self.build_watch_match(event)
+            if watch_match is None:
+                continue
+            if only_future and watch_match.end_at and watch_match.end_at < now:
+                continue
+            matches.append(watch_match)
+        return matches
 
     def collect_cs2_market_snapshots(self, max_pages: int = 5) -> list[OddsSnapshot]:
         snapshots: list[OddsSnapshot] = []

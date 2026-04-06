@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from datetime import datetime, timezone
 
 import typer
 from rich.console import Console
@@ -135,6 +136,44 @@ def db_summary() -> None:
         table.add_row(str(market_type), str(count))
     console.print(table)
     console.print(f'[cyan]Total odds snapshots:[/cyan] {total_snapshots}')
+
+
+@app.command()
+def watch_today(limit: int = 12, max_pages: int = 5) -> None:
+    poly = PolymarketCollector()
+    matches = poly.list_watch_matches(max_pages=max_pages, only_future=True)
+    matches.sort(key=lambda m: ((m.end_at or datetime.max.replace(tzinfo=timezone.utc)), -m.score))
+
+    table = Table(title='Today / Upcoming CS2 Watchlist')
+    table.add_column('End (UTC)')
+    table.add_column('Match')
+    table.add_column('Moneyline')
+    table.add_column('O/U 2.5')
+    table.add_column('Handicap')
+    table.add_column('Score')
+
+    for match in matches[:limit]:
+        end_at = match.end_at.isoformat(timespec='minutes') if match.end_at else '-'
+        moneyline = '-'
+        total = '-'
+        handicap = '-'
+
+        if match.match_market and len(match.match_market.outcomes) >= 2 and len(match.match_market.prices) >= 2:
+            moneyline = (
+                f"{match.match_market.outcomes[0]} {match.match_market.prices[0]:.3f} | "
+                f"{match.match_market.outcomes[1]} {match.match_market.prices[1]:.3f}"
+            )
+        if match.total_market and len(match.total_market.outcomes) >= 2 and len(match.total_market.prices) >= 2:
+            total = f"{match.total_market.prices[0]:.3f} / {match.total_market.prices[1]:.3f}"
+        if match.handicap_market and len(match.handicap_market.outcomes) >= 2 and len(match.handicap_market.prices) >= 2:
+            handicap = (
+                f"{match.handicap_market.outcomes[0]} {match.handicap_market.prices[0]:.3f} | "
+                f"{match.handicap_market.outcomes[1]} {match.handicap_market.prices[1]:.3f}"
+            )
+
+        table.add_row(end_at, match.title, moneyline, total, handicap, f'{match.score:.2f}')
+
+    console.print(table)
 
 
 @app.command()
